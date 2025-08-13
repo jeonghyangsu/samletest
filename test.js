@@ -140,6 +140,19 @@ function getPartyDetails(pid, socket) {
     });
 }
 
+function updatePartyMembers(partyId) {
+    const party = parties.get(partyId);
+    if (!party) return;
+
+    for (const [memberId] of party.members.entries()) {
+        const memberUser = users.get(memberId);
+        const memberSocket = io.sockets.sockets.get(memberUser?.socketId);
+        if (memberSocket) {
+            getPartyDetails(partyId, memberSocket);
+        }
+    }
+}
+
 // 가입 요청 리스트 가져오기
 function getJoinRequests(party) {
     const updatedRequests = [];
@@ -483,10 +496,71 @@ io.on('connection', socket => {
         getPartyDetails(data.partyId, socket);
     });
 
+    // 모집 완료 처리
+    socket.on('close_position', ({ partyId, positionId }) => {
+        const party = parties.get(partyId);
+        if (!party) return;
+        if (party.leaderId !== userId) return;
+
+        const position = party.positions.find(p => p.id === positionId);
+        if (!position) return;
+        if (position.closed) return;  // 이미 닫혀있으면 무시
+
+        position.closed = true;
+
+        let removedUsers = [];
+        for (const [uid, posMap] of party.joinRequests.entries()) {
+            if (posMap.has(positionId)) {
+                posMap.delete(positionId);
+                if (posMap.size === 0) party.joinRequests.delete(uid);
+                removedUsers.push(uid);
+            }
+        }
+
+        // 파티장에게 가입 요청 리스트 갱신
+        const leaderSocket = io.sockets.sockets.get(users.get(party.leaderId)?.socketId);
+        if (leaderSocket) updateJoinRequests(party, leaderSocket);
+
+        // 가입 요청 삭제된 유저들 거절 알림 + 상세정보 갱신
+        for (const uid of removedUsers) {
+            const user = users.get(uid);
+            if (!user) continue;
+
+            const targetSocket = io.sockets.sockets.get(user.socketId);
+            if (targetSocket) {
+                targetSocket.emit('join_request_rejected', { partyId, position });
+                getPartyDetails(partyId, targetSocket);
+            }
+        }
+
+        // 파티 멤버 전체에 최신 파티 상세정보 전송
+        updatePartyMembers(partyId);
+
+        logEvent('모집 완료', `partyId=${partyId}, positionId=${positionId}`);
+    });
+
+    // 모집 완료 취소 처리
+    socket.on('reopen_position', ({ partyId, positionId }) => {
+        const party = parties.get(partyId);
+        if (!party) return;
+        if (party.leaderId !== userId) return;
+
+        const position = party.positions.find(p => p.id === positionId);
+        if (!position) return;
+        if (!position.closed) return; // 이미 열려있으면 무시
+
+        position.closed = false;
+
+        // 파티 멤버 전체에 최신 파티 상세정보 전송
+        updatePartyMembers(partyId);
+
+        logEvent('모집 재개', `partyId=${partyId}, positionId=${positionId}`);
+    });
+
     socket.on('request_join_party', data => {
         const pid = data.partyId;
         const position = data.position;
-        const positionId = position.id;  // ← 고유 ID 추출
+        const positionId = position.id;
         if (!pid || !parties.has(pid)) return;
         const party = parties.get(pid);
 
@@ -569,7 +643,7 @@ io.on('connection', socket => {
                         const otherUser = users.get(uid);
                         const otherSocket = io.sockets.sockets.get(otherUser?.socketId);
                         if (otherSocket) {
-                            getPartyDetails(otherUser.partyId, otherSocket);
+                            getPartyDetails(pid, otherSocket);
                         }
                     }
                 }
@@ -594,10 +668,10 @@ io.on('connection', socket => {
                         leaderId: party.leaderId,
                         members: getPartyMembersData(party),
                     });
-
-                    // 파티 상세정보 갱신
-                    getPartyDetails(targetUser.partyId, targetSocket);
                 }
+
+                // 파티원 전체 파티 정보 갱신
+                updatePartyMembers(pid);
             }
         } else {
             // 가입 요청 거절
@@ -620,7 +694,7 @@ io.on('connection', socket => {
                 });
 
                 // 파티 상세정보 갱신
-                getPartyDetails(targetUser.partyId, targetSocket);
+                getPartyDetails(pid, targetSocket);
             }
         }
 
